@@ -113,16 +113,34 @@ def trigger_build(
     build_type: str = "debug",
     zip_bytes: bytes | None = None,
     zip_filename: str = "project.zip",
+    language: str = "kotlin",
+    min_sdk: int = 21,
+    target_sdk: int = 34,
+    compile_sdk: int = 34,
+    minify: bool = False,
+    icon_bytes: bytes | None = None,
 ) -> str:
     """
     Trigger the GitHub Actions build workflow.
     Returns the workflow run ID (as string) to poll later.
+
+    language/min_sdk/target_sdk/compile_sdk/minify/icon_bytes only take
+    effect in scaffold mode (i.e. when zip_bytes is not provided) — an
+    uploaded project's own Gradle files and resources are used as-is.
     """
+    import base64
+
     inputs = {
         "app_name":    app_name,
         "package_name": package_name,
         "build_type":  build_type,
         "zip_artifact_id": "",
+        "language":    language,
+        "min_sdk":     str(min_sdk),
+        "target_sdk":  str(target_sdk),
+        "compile_sdk": str(compile_sdk),
+        "minify":      "true" if minify else "false",
+        "icon_base64": base64.b64encode(icon_bytes).decode() if icon_bytes else "",
     }
 
     if zip_bytes:

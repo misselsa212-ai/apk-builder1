@@ -21,6 +21,34 @@ on:
         description: "Run ID of uploaded zip (leave empty for scaffold mode)"
         required: false
         default: ""
+      language:
+        description: "Language (scaffold mode only)"
+        required: false
+        default: "kotlin"
+        type: choice
+        options: [kotlin, java]
+      min_sdk:
+        description: "Minimum SDK version (scaffold mode only)"
+        required: false
+        default: "21"
+      target_sdk:
+        description: "Target SDK version (scaffold mode only)"
+        required: false
+        default: "34"
+      compile_sdk:
+        description: "Compile SDK version (scaffold mode only)"
+        required: false
+        default: "34"
+      minify:
+        description: "Enable ProGuard/R8 minification for release builds (scaffold mode only)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      icon_base64:
+        description: "Base64-encoded PNG app icon (optional, scaffold mode only)"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -43,10 +71,18 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install build tools + platform
+      - name: Install Android SDK components
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" --sdk_root=$ANDROID_HOME
+          yes | sdkmanager --licenses --sdk_root=$ANDROID_HOME >/dev/null 2>&1 || true
+          sdkmanager --sdk_root=$ANDROID_HOME \
+            "platform-tools" \
+            "platforms;android-30" "platforms;android-31" "platforms;android-32" \
+            "platforms;android-33" "platforms;android-34" "platforms;android-35" \
+            "build-tools;30.0.3" "build-tools;33.0.2" "build-tools;34.0.0" "build-tools;35.0.0" \
+            "cmake;3.22.1" \
+            "ndk;26.1.10909125"
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
 
       # ── 4. Download uploaded zip OR scaffold fresh project ────────────
       - name: Prepare project
@@ -55,6 +91,12 @@ jobs:
           PKG: ${{ github.event.inputs.package_name }}
           BUILD_TYPE: ${{ github.event.inputs.build_type }}
           ZIP_URL: ${{ github.event.inputs.zip_artifact_id }}
+          LANGUAGE: ${{ github.event.inputs.language }}
+          MIN_SDK: ${{ github.event.inputs.min_sdk }}
+          TARGET_SDK: ${{ github.event.inputs.target_sdk }}
+          COMPILE_SDK: ${{ github.event.inputs.compile_sdk }}
+          MINIFY: ${{ github.event.inputs.minify }}
+          ICON_B64: ${{ github.event.inputs.icon_base64 }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p /tmp/android_project
@@ -74,10 +116,21 @@ jobs:
             fi
           else
             echo "🏗️  Scaffolding fresh Android project..."
+            ICON_ARGS=()
+            if [ -n "$ICON_B64" ]; then
+              echo "$ICON_B64" | base64 -d > /tmp/icon.png
+              ICON_ARGS=(--icon /tmp/icon.png)
+            fi
             python3 builder/scaffold.py \
               --app-name "$APP_NAME" \
               --package "$PKG" \
-              --out /tmp/android_project
+              --out /tmp/android_project \
+              --language "$LANGUAGE" \
+              --min-sdk "$MIN_SDK" \
+              --target-sdk "$TARGET_SDK" \
+              --compile-sdk "$COMPILE_SDK" \
+              --minify "$MINIFY" \
+              "${ICON_ARGS[@]}"
           fi
 
       # ── 5. Validate project structure ─────────────────────────────────
@@ -154,7 +207,47 @@ jobs:
           echo "apk_sha256=$SHA" >> $GITHUB_OUTPUT
           echo "✅ APK: $DEST ($SIZE) — SHA256: $SHA"
 
-      # ── 9. Verify APK ─────────────────────────────────────────────────
+      # ── 9. Sign release APK (optional — needs KEYSTORE_* repo secrets) ─
+      - name: Sign release APK
+        if: ${{ github.event.inputs.build_type == 'release' && secrets.KEYSTORE_BASE64 != '' }}
+        env:
+          APK_PATH: ${{ steps.locate_apk.outputs.apk_path }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+
+          KEYSTORE=/tmp/release.keystore
+          echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+
+          ALIGNED="${APK_PATH%.apk}-aligned.apk"
+          SIGNED="${APK_PATH%.apk}-signed.apk"
+
+          "$ZIPALIGN" -f -p 4 "$APK_PATH" "$ALIGNED"
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --out "$SIGNED" \
+            "$ALIGNED"
+
+          rm -f "$KEYSTORE" "$ALIGNED"
+          mv "$SIGNED" "$APK_PATH"
+
+          NEW_SIZE=$(du -sh "$APK_PATH" | cut -f1)
+          NEW_SHA=$(sha256sum "$APK_PATH" | cut -d' ' -f1)
+          echo "apk_size=$NEW_SIZE" >> $GITHUB_OUTPUT
+          echo "apk_sha256=$NEW_SHA" >> $GITHUB_OUTPUT
+          echo "apk_signed=true" >> $GITHUB_OUTPUT
+          echo "✅ Release APK signed — SHA256: $NEW_SHA"
+        id: sign_apk
+
+      # ── 10. Verify APK ─────────────────────────────────────────────────
       - name: Verify APK
         env:
           APK_PATH: ${{ steps.locate_apk.outputs.apk_path }}
@@ -166,7 +259,7 @@ jobs:
             --expected-package "$PKG" \
             --build-type "$BUILD_TYPE"
 
-      # ── 10. Upload APK as artifact ────────────────────────────────────
+      # ── 11. Upload APK as artifact ────────────────────────────────────
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -174,12 +267,13 @@ jobs:
           path: ${{ steps.locate_apk.outputs.apk_path }}
           retention-days: 7
 
-      # ── 11. Write build summary ───────────────────────────────────────
+      # ── 12. Write build summary ───────────────────────────────────────
       - name: Build summary
         env:
           APK_NAME: ${{ steps.locate_apk.outputs.apk_name }}
-          APK_SIZE: ${{ steps.locate_apk.outputs.apk_size }}
-          APK_SHA: ${{ steps.locate_apk.outputs.apk_sha256 }}
+          APK_SIZE: ${{ steps.sign_apk.outputs.apk_size || steps.locate_apk.outputs.apk_size }}
+          APK_SHA: ${{ steps.sign_apk.outputs.apk_sha256 || steps.locate_apk.outputs.apk_sha256 }}
+          APK_SIGNED: ${{ steps.sign_apk.outputs.apk_signed == 'true' && 'yes (release keystore)' || (github.event.inputs.build_type == 'debug' && 'yes (debug key)' || 'no — add KEYSTORE_* repo secrets to sign release builds') }}
           APP_NAME: ${{ github.event.inputs.app_name }}
           PKG: ${{ github.event.inputs.package_name }}
           BUILD_TYPE: ${{ github.event.inputs.build_type }}
@@ -195,6 +289,7 @@ jobs:
           | APK Name | $APK_NAME |
           | Size | $APK_SIZE |
           | SHA-256 | \`$APK_SHA\` |
+          | Signed | $APK_SIGNED |
 
           **Download:** Go to Actions → this run → Artifacts section
           EOF

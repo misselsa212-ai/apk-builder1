@@ -56,6 +56,12 @@ def build_apk(
     package_name: str,
     build_type: str,
     uploaded_file,      # Gradio File object or None
+    language: str = "kotlin",
+    min_sdk: int = 21,
+    target_sdk: int = 34,
+    compile_sdk: int = 34,
+    minify: bool = False,
+    icon_file=None,     # Gradio File object or None
 ):
     """
     Generator: yields (log_text, apk_file_path) tuples for Gradio live update.
@@ -119,6 +125,19 @@ def build_apk(
             return
     else:
         yield log("🏗️  No ZIP uploaded — will scaffold a fresh Android project."), None
+        yield log(f"  Language     : {language}"), None
+        yield log(f"  Min/Target/Compile SDK : {min_sdk}/{target_sdk}/{compile_sdk}"), None
+        yield log(f"  Minify (R8)  : {minify}"), None
+
+    # ── Read uploaded icon (scaffold mode only) ─────────────────────────────
+    icon_bytes = None
+    if icon_file is not None and uploaded_file is None:
+        try:
+            with open(icon_file.name, "rb") as f:
+                icon_bytes = f.read()
+            yield log(f"🎨 Icon loaded: {os.path.basename(icon_file.name)}"), None
+        except Exception as e:
+            yield log(f"⚠️  Icon read error (continuing without it): {e}"), None
 
     yield log(f"\n  App Name : {app_name}"), None
     yield log(f"  Package  : {package_name}"), None
@@ -133,6 +152,12 @@ def build_apk(
             build_type=build_type,
             zip_bytes=zip_bytes,
             zip_filename=zip_filename,
+            language=language,
+            min_sdk=int(min_sdk),
+            target_sdk=int(target_sdk),
+            compile_sdk=int(compile_sdk),
+            minify=minify,
+            icon_bytes=icon_bytes,
         )
     except Exception as e:
         yield log(f"❌ Trigger failed: {e}"), None
@@ -243,12 +268,41 @@ Build runs on GitHub Actions (free tier) — no cost, no setup on your end.
             inp_type = gr.Radio(
                 choices=["debug", "release"], value="debug",
                 label="Build Type",
-                info="Debug = signed with debug key. Release = unsigned (you sign later)."
+                info=("Debug = signed with debug key. Release = signed automatically "
+                      "if KEYSTORE_* secrets are set on the repo, otherwise unsigned.")
+            )
+
+            gr.Markdown("### 🛠️ Tools (scaffold mode only)")
+            with gr.Row():
+                inp_lang = gr.Radio(
+                    choices=["kotlin", "java"], value="kotlin", label="Language"
+                )
+                inp_minify = gr.Checkbox(
+                    value=False, label="Minify release (ProGuard/R8)"
+                )
+            with gr.Row():
+                inp_min_sdk = gr.Dropdown(
+                    choices=[str(v) for v in (16, 19, 21, 23, 24, 26, 28, 30, 33, 34)],
+                    value="21", label="Min SDK",
+                )
+                inp_target_sdk = gr.Dropdown(
+                    choices=[str(v) for v in (30, 31, 32, 33, 34, 35)],
+                    value="34", label="Target SDK",
+                )
+                inp_compile_sdk = gr.Dropdown(
+                    choices=[str(v) for v in (30, 31, 32, 33, 34, 35)],
+                    value="34", label="Compile SDK",
+                )
+            inp_icon = gr.File(
+                label="App icon (.png, optional)",
+                file_types=[".png"],
+                file_count="single",
             )
 
             gr.Markdown("### 📦 Upload Project (optional)")
             gr.Markdown(
-                "_ZIP of your Android project. If empty, a minimal scaffold is generated._"
+                "_ZIP of your Android project. If empty, a minimal scaffold is generated "
+                "using the Tools settings above._"
             )
             inp_zip = gr.File(
                 label="Upload .zip",
@@ -291,12 +345,20 @@ Build runs on GitHub Actions (free tier) — no cost, no setup on your end.
 1. Fork this repo to your GitHub account
 2. Add `GH_TOKEN` (GitHub PAT, Actions write scope) and `GH_REPO` to HF Space secrets
 3. Done — every build is free via GitHub Actions (2000 min/month free tier)
+
+**Optional — sign release builds:**
+Add `KEYSTORE_BASE64` (your `.jks`/`.keystore` file, base64-encoded), `KEYSTORE_PASSWORD`,
+`KEY_ALIAS`, and `KEY_PASSWORD` as **repo secrets** (Settings → Secrets → Actions) on the
+GitHub repo. When present, `release` builds are zipaligned and signed automatically.
 """)
 
     # ── Wire up ───────────────────────────────────────────────────────────────
     btn_build.click(
         fn=build_apk,
-        inputs=[inp_name, inp_pkg, inp_type, inp_zip],
+        inputs=[
+            inp_name, inp_pkg, inp_type, inp_zip,
+            inp_lang, inp_min_sdk, inp_target_sdk, inp_compile_sdk, inp_minify, inp_icon,
+        ],
         outputs=[out_log, out_apk],
     )
 
