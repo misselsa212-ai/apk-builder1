@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "builder"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "builder"))
 
 try:
-    from github_trigger import trigger_build, poll_run, download_artifact
+    from github_trigger import trigger_build, trigger_rebrand, poll_run, download_artifact
     GH_AVAILABLE = True
 except ImportError:
     GH_AVAILABLE = False
@@ -56,6 +56,12 @@ def build_apk(
     package_name: str,
     build_type: str,
     uploaded_file,      # Gradio File object or None
+    language: str = "kotlin",
+    min_sdk: int = 21,
+    target_sdk: int = 34,
+    compile_sdk: int = 34,
+    minify: bool = False,
+    icon_file=None,     # Gradio File object or None
 ):
     """
     Generator: yields (log_text, apk_file_path) tuples for Gradio live update.
@@ -119,6 +125,19 @@ def build_apk(
             return
     else:
         yield log("🏗️  No ZIP uploaded — will scaffold a fresh Android project."), None
+        yield log(f"  Language     : {language}"), None
+        yield log(f"  Min/Target/Compile SDK : {min_sdk}/{target_sdk}/{compile_sdk}"), None
+        yield log(f"  Minify (R8)  : {minify}"), None
+
+    # ── Read uploaded icon (scaffold mode only) ─────────────────────────────
+    icon_bytes = None
+    if icon_file is not None and uploaded_file is None:
+        try:
+            with open(icon_file.name, "rb") as f:
+                icon_bytes = f.read()
+            yield log(f"🎨 Icon loaded: {os.path.basename(icon_file.name)}"), None
+        except Exception as e:
+            yield log(f"⚠️  Icon read error (continuing without it): {e}"), None
 
     yield log(f"\n  App Name : {app_name}"), None
     yield log(f"  Package  : {package_name}"), None
@@ -133,6 +152,12 @@ def build_apk(
             build_type=build_type,
             zip_bytes=zip_bytes,
             zip_filename=zip_filename,
+            language=language,
+            min_sdk=int(min_sdk),
+            target_sdk=int(target_sdk),
+            compile_sdk=int(compile_sdk),
+            minify=minify,
+            icon_bytes=icon_bytes,
         )
     except Exception as e:
         yield log(f"❌ Trigger failed: {e}"), None
@@ -204,6 +229,140 @@ def build_apk(
         yield log(f"❌ Download failed: {e}"), None
 
 
+# ── Rebrand flow (rename / re-icon an already-built APK) ───────────────────────
+
+def rebrand_apk(
+    apk_file,           # Gradio File object (required)
+    new_app_name: str,
+    icon_file,           # Gradio File object or None
+):
+    """
+    Generator: yields (log_text, apk_file_path) tuples for Gradio live update.
+    Renames and/or re-icons an already-built APK without rebuilding from source.
+    """
+    log_lines = []
+    def log(msg: str):
+        log_lines.append(msg)
+        return "\n".join(log_lines)
+
+    new_app_name = (new_app_name or "").strip()
+
+    if apk_file is None:
+        yield log("❌ Upload an APK to rebrand first."), None
+        return
+
+    if not new_app_name and icon_file is None:
+        yield log("❌ Set a new app name and/or upload a new icon — nothing to change otherwise."), None
+        return
+
+    ok, cfg_msg = _cfg_ok()
+    yield log(cfg_msg), None
+    if not ok:
+        return
+
+    try:
+        fname = os.path.basename(apk_file.name)
+        if not fname.lower().endswith(".apk"):
+            yield log(f"❌ Upload must be a .apk file — got: {fname}"), None
+            return
+        with open(apk_file.name, "rb") as f:
+            apk_bytes = f.read()
+        yield log(f"📦 APK loaded: {fname} ({len(apk_bytes) / 1e6:.1f} MB)"), None
+    except Exception as e:
+        yield log(f"❌ File read error: {e}"), None
+        return
+
+    icon_bytes = None
+    if icon_file is not None:
+        try:
+            with open(icon_file.name, "rb") as f:
+                icon_bytes = f.read()
+            yield log(f"🎨 Icon loaded: {os.path.basename(icon_file.name)}"), None
+        except Exception as e:
+            yield log(f"❌ Icon read error: {e}"), None
+            return
+
+    if new_app_name:
+        yield log(f"  New name : {new_app_name}"), None
+
+    base_name = os.path.splitext(fname)[0]
+    output_name = f"{base_name}-rebranded"
+    yield log(f"\n⚡ Triggering GitHub Actions rebrand..."), None
+
+    try:
+        run_id = trigger_rebrand(
+            apk_bytes=apk_bytes,
+            apk_filename=fname,
+            app_name=new_app_name or None,
+            icon_bytes=icon_bytes,
+            output_name=output_name,
+        )
+    except Exception as e:
+        yield log(f"❌ Trigger failed: {e}"), None
+        return
+
+    repo = os.environ.get("GH_REPO", "")
+    yield log(f"✅ Rebrand triggered — Run ID: {run_id}"), None
+    yield log(f"   👁  https://github.com/{repo}/actions/runs/{run_id}"), None
+    yield log(f"\n⏳ Polling for completion..."), None
+    yield log("─" * 60), None
+
+    artifact_info = None
+    try:
+        gen = poll_run(run_id)
+        while True:
+            try:
+                status = next(gen)
+                step   = status.get("step", "")
+                elapsed = status.get("elapsed_s", 0)
+                mins, secs = divmod(elapsed, 60)
+                time_str = f"{mins}m{secs:02d}s"
+                status_str = status.get("status", "")
+                line = f"  [{time_str}]  {status_str}"
+                if step:
+                    line += f"  →  {step}"
+                yield log(line), None
+            except StopIteration as si:
+                artifact_info = si.value
+                break
+    except RuntimeError as e:
+        yield log(f"\n❌ Rebrand failed: {e}"), None
+        return
+    except Exception as e:
+        yield log(f"\n❌ Poll error: {e}"), None
+        return
+
+    yield log("\n✅ Rebrand complete! Downloading APK..."), None
+
+    try:
+        artifact_id   = artifact_info["artifact_id"]
+        artifact_name = artifact_info["artifact_name"]
+        outer_zip     = download_artifact(artifact_id)
+
+        with zipfile.ZipFile(io.BytesIO(outer_zip)) as z:
+            apk_names = [n for n in z.namelist() if n.endswith(".apk")]
+            if not apk_names:
+                yield log("❌ No APK found inside artifact zip."), None
+                return
+            apk_data = z.read(apk_names[0])
+
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=f"-{artifact_name}.apk", delete=False
+        )
+        tmp.write(apk_data)
+        tmp.flush()
+        tmp.close()
+
+        size_mb = len(apk_data) / 1e6
+        yield log(f"\n🎉 Rebranded APK ready!"), None
+        yield log(f"   📦 {artifact_name}  ({size_mb:.1f} MB)"), None
+        yield log(f"   🔗 {artifact_info.get('run_url', '')}"), None
+        yield log(f"\n✅ Click 'Download APK' below to save to your device!"), tmp.name
+
+    except Exception as e:
+        yield log(f"❌ Download failed: {e}"), None
+
+
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 
 CSS = """
@@ -235,7 +394,9 @@ Upload your Android project ZIP **or** just enter app details to scaffold one fr
 Build runs on GitHub Actions (free tier) — no cost, no setup on your end.
 """)
 
-    with gr.Row():
+    with gr.Tabs():
+     with gr.Tab("🏗️ Build APK"):
+      with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### ⚙️ App Details")
             inp_name = gr.Textbox(label="App Name",     value="My App",            lines=1)
@@ -243,12 +404,41 @@ Build runs on GitHub Actions (free tier) — no cost, no setup on your end.
             inp_type = gr.Radio(
                 choices=["debug", "release"], value="debug",
                 label="Build Type",
-                info="Debug = signed with debug key. Release = unsigned (you sign later)."
+                info=("Debug = signed with debug key. Release = signed automatically "
+                      "if KEYSTORE_* secrets are set on the repo, otherwise unsigned.")
+            )
+
+            gr.Markdown("### 🛠️ Tools (scaffold mode only)")
+            with gr.Row():
+                inp_lang = gr.Radio(
+                    choices=["kotlin", "java"], value="kotlin", label="Language"
+                )
+                inp_minify = gr.Checkbox(
+                    value=False, label="Minify release (ProGuard/R8)"
+                )
+            with gr.Row():
+                inp_min_sdk = gr.Dropdown(
+                    choices=[str(v) for v in (16, 19, 21, 23, 24, 26, 28, 30, 33, 34)],
+                    value="21", label="Min SDK",
+                )
+                inp_target_sdk = gr.Dropdown(
+                    choices=[str(v) for v in (30, 31, 32, 33, 34, 35)],
+                    value="34", label="Target SDK",
+                )
+                inp_compile_sdk = gr.Dropdown(
+                    choices=[str(v) for v in (30, 31, 32, 33, 34, 35)],
+                    value="34", label="Compile SDK",
+                )
+            inp_icon = gr.File(
+                label="App icon (.png, optional)",
+                file_types=[".png"],
+                file_count="single",
             )
 
             gr.Markdown("### 📦 Upload Project (optional)")
             gr.Markdown(
-                "_ZIP of your Android project. If empty, a minimal scaffold is generated._"
+                "_ZIP of your Android project. If empty, a minimal scaffold is generated "
+                "using the Tools settings above._"
             )
             inp_zip = gr.File(
                 label="Upload .zip",
@@ -277,7 +467,7 @@ Build runs on GitHub Actions (free tier) — no cost, no setup on your end.
                 ),
             )
 
-    gr.Markdown("""
+      gr.Markdown("""
 ---
 **How it works:**
 
@@ -291,13 +481,80 @@ Build runs on GitHub Actions (free tier) — no cost, no setup on your end.
 1. Fork this repo to your GitHub account
 2. Add `GH_TOKEN` (GitHub PAT, Actions write scope) and `GH_REPO` to HF Space secrets
 3. Done — every build is free via GitHub Actions (2000 min/month free tier)
+
+**Optional — sign release builds:**
+Add `KEYSTORE_BASE64` (your `.jks`/`.keystore` file, base64-encoded), `KEYSTORE_PASSWORD`,
+`KEY_ALIAS`, and `KEY_PASSWORD` as **repo secrets** (Settings → Secrets → Actions) on the
+GitHub repo. When present, `release` builds are zipaligned and signed automatically.
+""")
+
+     with gr.Tab("🎨 Rename / Re-icon APK"):
+      with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### 📱 Source APK")
+            reb_apk = gr.File(
+                label="Upload .apk to rebrand",
+                file_types=[".apk"],
+                file_count="single",
+            )
+
+            gr.Markdown("### ✏️ New Branding")
+            reb_name = gr.Textbox(
+                label="New App Name",
+                placeholder="Leave empty to keep the current name",
+                lines=1,
+            )
+            reb_icon = gr.File(
+                label="New app icon (.png, optional)",
+                file_types=[".png"],
+                file_count="single",
+            )
+
+            btn_rebrand = gr.Button("🎨 REBRAND APK", variant="primary")
+
+            gr.Markdown("### 📥 Download")
+            reb_out_apk = gr.File(label="Rebranded APK", interactive=False)
+
+        with gr.Column(scale=2):
+            gr.Markdown("### 📋 Rebrand Log (live)")
+            reb_out_log = gr.Textbox(
+                label="",
+                lines=30,
+                max_lines=300,
+                placeholder=(
+                    "1. Upload an existing .apk\n"
+                    "2. Enter a new app name and/or upload a new icon\n"
+                    "3. Click REBRAND APK\n"
+                    "4. Watch the log — takes 1–3 min\n"
+                    "5. Renamed / re-iconed APK appears automatically\n\n"
+                    "Works on any APK — no source project needed. "
+                    "Decodes with apktool, edits the manifest/resources, "
+                    "rebuilds, then zipaligns + signs the result."
+                ),
+            )
+
+      gr.Markdown("""
+---
+**How it works:** apktool decodes the uploaded APK, the app name / launcher icon
+are patched in place, then the APK is rebuilt, zipaligned, and re-signed
+(with your `KEYSTORE_*` repo secrets if set, otherwise a throwaway debug key —
+either way the output is a valid, installable APK, just no longer signed with
+the *original* app's key, so it can't be installed as an update over it).
 """)
 
     # ── Wire up ───────────────────────────────────────────────────────────────
     btn_build.click(
         fn=build_apk,
-        inputs=[inp_name, inp_pkg, inp_type, inp_zip],
+        inputs=[
+            inp_name, inp_pkg, inp_type, inp_zip,
+            inp_lang, inp_min_sdk, inp_target_sdk, inp_compile_sdk, inp_minify, inp_icon,
+        ],
         outputs=[out_log, out_apk],
+    )
+    btn_rebrand.click(
+        fn=rebrand_apk,
+        inputs=[reb_apk, reb_name, reb_icon],
+        outputs=[reb_out_log, reb_out_apk],
     )
 
 if __name__ == "__main__":

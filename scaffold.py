@@ -49,13 +49,12 @@ def gen_settings_gradle(app_name: str) -> str:
     """)
 
 
-def gen_root_build_gradle() -> str:
-    return textwrap.dedent("""\
-        plugins {
-            id 'com.android.application' version '8.3.2' apply false
-            id 'org.jetbrains.kotlin.android' version '1.9.23' apply false
-        }
-    """)
+def gen_root_build_gradle(language: str) -> str:
+    lines = ["plugins {", "    id 'com.android.application' version '8.3.2' apply false"]
+    if language == "kotlin":
+        lines.append("    id 'org.jetbrains.kotlin.android' version '1.9.23' apply false")
+    lines.append("}\n")
+    return "\n".join(lines)
 
 
 def gen_gradle_properties() -> str:
@@ -68,21 +67,30 @@ def gen_gradle_properties() -> str:
     """)
 
 
-def gen_app_build_gradle(pkg: str) -> str:
-    return textwrap.dedent(f"""\
+def gen_app_build_gradle(
+    pkg: str,
+    language: str = "kotlin",
+    min_sdk: int = 21,
+    target_sdk: int = 34,
+    compile_sdk: int = 34,
+    minify: bool = False,
+) -> str:
+    minify_str = "true" if minify else "false"
+
+    template = textwrap.dedent(f"""\
         plugins {{
             id 'com.android.application'
-            id 'org.jetbrains.kotlin.android'
+            __KOTLIN_PLUGIN__
         }}
 
         android {{
             namespace '{pkg}'
-            compileSdk 34
+            compileSdk {compile_sdk}
 
             defaultConfig {{
                 applicationId "{pkg}"
-                minSdk 21
-                targetSdk 34
+                minSdk {min_sdk}
+                targetSdk {target_sdk}
                 versionCode 1
                 versionName "1.0"
             }}
@@ -93,7 +101,7 @@ def gen_app_build_gradle(pkg: str) -> str:
                     debuggable true
                 }}
                 release {{
-                    minifyEnabled false
+                    minifyEnabled {minify_str}
                     proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
                 }}
             }}
@@ -102,21 +110,34 @@ def gen_app_build_gradle(pkg: str) -> str:
                 sourceCompatibility JavaVersion.VERSION_17
                 targetCompatibility JavaVersion.VERSION_17
             }}
-            kotlinOptions {{
-                jvmTarget = '17'
-            }}
+            __KOTLIN_OPTIONS__
         }}
 
         dependencies {{
-            implementation 'androidx.core:core-ktx:1.13.1'
+            __KOTLIN_DEP__
             implementation 'androidx.appcompat:appcompat:1.7.0'
             implementation 'com.google.android.material:material:1.12.0'
         }}
     """)
 
+    is_kotlin = language == "kotlin"
+    template = template.replace(
+        "    __KOTLIN_PLUGIN__\n",
+        "    id 'org.jetbrains.kotlin.android'\n" if is_kotlin else "",
+    )
+    template = template.replace(
+        "    __KOTLIN_OPTIONS__\n",
+        "    kotlinOptions {\n        jvmTarget = '17'\n    }\n" if is_kotlin else "",
+    )
+    template = template.replace(
+        "    __KOTLIN_DEP__\n",
+        "    implementation 'androidx.core:core-ktx:1.13.1'\n" if is_kotlin else "",
+    )
+    return template
 
-def gen_manifest(pkg: str, app_name: str, theme: str) -> str:
-    return textwrap.dedent(f"""\
+
+def gen_manifest(pkg: str, app_name: str, theme: str, has_icon: bool = False) -> str:
+    template = textwrap.dedent(f"""\
         <?xml version="1.0" encoding="utf-8"?>
         <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -125,6 +146,7 @@ def gen_manifest(pkg: str, app_name: str, theme: str) -> str:
             <application
                 android:allowBackup="true"
                 android:label="{app_name}"
+                __ICON_ATTR__
                 android:supportsRtl="true"
                 android:theme="@style/{theme}">
 
@@ -140,6 +162,10 @@ def gen_manifest(pkg: str, app_name: str, theme: str) -> str:
             </application>
         </manifest>
     """)
+    return template.replace(
+        "        __ICON_ATTR__\n",
+        '        android:icon="@mipmap/ic_launcher"\n' if has_icon else "",
+    )
 
 
 def gen_main_activity(pkg: str, app_name: str) -> str:
@@ -161,6 +187,30 @@ def gen_main_activity(pkg: str, app_name: str) -> str:
                     setPadding(32, 32, 32, 32)
                 }}
                 setContentView(tv)
+            }}
+        }}
+    """)
+
+
+def gen_main_activity_java(pkg: str, app_name: str) -> str:
+    return textwrap.dedent(f"""\
+        package {pkg};
+
+        import android.app.Activity;
+        import android.os.Bundle;
+        import android.widget.TextView;
+        import android.view.Gravity;
+
+        public class MainActivity extends Activity {{
+            @Override
+            protected void onCreate(Bundle savedInstanceState) {{
+                super.onCreate(savedInstanceState);
+                TextView tv = new TextView(this);
+                tv.setText("{app_name}");
+                tv.setTextSize(28f);
+                tv.setGravity(Gravity.CENTER);
+                tv.setPadding(32, 32, 32, 32);
+                setContentView(tv);
             }}
         }}
     """)
@@ -229,20 +279,35 @@ def gen_gradle_wrapper_props() -> str:
 
 # ── Main scaffold ─────────────────────────────────────────────────────────────
 
-def scaffold(app_name: str, pkg: str, out: str) -> None:
+def scaffold(
+    app_name: str,
+    pkg: str,
+    out: str,
+    language: str = "kotlin",
+    min_sdk: int = 21,
+    target_sdk: int = 34,
+    compile_sdk: int = 34,
+    minify: bool = False,
+    icon: str | None = None,
+) -> None:
     print(f"\n🏗️  Scaffolding Android project")
-    print(f"   App Name : {app_name}")
-    print(f"   Package  : {pkg}")
-    print(f"   Output   : {out}")
+    print(f"   App Name   : {app_name}")
+    print(f"   Package    : {pkg}")
+    print(f"   Language   : {language}")
+    print(f"   Min/Target/Compile SDK : {min_sdk}/{target_sdk}/{compile_sdk}")
+    print(f"   Minify     : {minify}")
+    print(f"   Icon       : {icon or '(none — default framework icon)'}")
+    print(f"   Output     : {out}")
     print()
 
     os.makedirs(out, exist_ok=True)
     pkg_path = pkg.replace(".", "/")
     theme = safe_theme(app_name)
+    has_icon = bool(icon and os.path.isfile(icon))
 
     # Root files
     w(out, "settings.gradle",        gen_settings_gradle(app_name))
-    w(out, "build.gradle",           gen_root_build_gradle())
+    w(out, "build.gradle",           gen_root_build_gradle(language))
     w(out, "gradle.properties",      gen_gradle_properties())
     w(out, "local.properties",       f"sdk.dir={os.environ.get('ANDROID_HOME', '/opt/android-sdk')}\n")
     w(out, "app/proguard-rules.pro", gen_proguard())
@@ -262,14 +327,30 @@ def scaffold(app_name: str, pkg: str, out: str) -> None:
     os.makedirs(jar_dir, exist_ok=True)
 
     # App module
-    w(out, "app/build.gradle", gen_app_build_gradle(pkg))
-    w(out, f"app/src/main/AndroidManifest.xml", gen_manifest(pkg, app_name, theme))
-    w(out, f"app/src/main/java/{pkg_path}/MainActivity.kt", gen_main_activity(pkg, app_name))
+    w(out, "app/build.gradle", gen_app_build_gradle(
+        pkg, language=language, min_sdk=min_sdk, target_sdk=target_sdk,
+        compile_sdk=compile_sdk, minify=minify,
+    ))
+    w(out, "app/src/main/AndroidManifest.xml", gen_manifest(pkg, app_name, theme, has_icon))
+
+    if language == "java":
+        w(out, f"app/src/main/java/{pkg_path}/MainActivity.java", gen_main_activity_java(pkg, app_name))
+    else:
+        w(out, f"app/src/main/java/{pkg_path}/MainActivity.kt", gen_main_activity(pkg, app_name))
 
     # Resources
     w(out, "app/src/main/res/values/strings.xml", gen_strings(app_name))
     w(out, "app/src/main/res/values/colors.xml",  gen_colors())
     w(out, "app/src/main/res/values/themes.xml",  gen_themes(theme))
+
+    # App icon (same PNG dropped into every density bucket — good enough for a build)
+    if has_icon:
+        import shutil
+        for density in ("mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"):
+            dest_dir = os.path.join(out, f"app/src/main/res/mipmap-{density}")
+            os.makedirs(dest_dir, exist_ok=True)
+            shutil.copyfile(icon, os.path.join(dest_dir, "ic_launcher.png"))
+        print(f"  wrote  app icon into mipmap-* ({icon})")
 
     print(f"\n✅ Scaffold complete — {out}")
 
@@ -281,10 +362,25 @@ if __name__ == "__main__":
     parser.add_argument("--app-name", required=True,  help="Display name of the app")
     parser.add_argument("--package",  required=True,  help="Package name (e.g. com.example.myapp)")
     parser.add_argument("--out",      required=True,  help="Output directory")
+    parser.add_argument("--language", default="kotlin", choices=["kotlin", "java"])
+    parser.add_argument("--min-sdk",     type=int, default=21)
+    parser.add_argument("--target-sdk",  type=int, default=34)
+    parser.add_argument("--compile-sdk", type=int, default=34)
+    parser.add_argument("--minify", default="false", choices=["true", "false"],
+                         help="Enable ProGuard/R8 minification for release builds")
+    parser.add_argument("--icon", default=None, help="Path to a PNG app icon (optional)")
     args = parser.parse_args()
 
     # Basic validation
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$", args.package):
         raise SystemExit(f"❌ Invalid package name: {args.package!r}")
 
-    scaffold(args.app_name, args.package, args.out)
+    scaffold(
+        args.app_name, args.package, args.out,
+        language=args.language,
+        min_sdk=args.min_sdk,
+        target_sdk=args.target_sdk,
+        compile_sdk=args.compile_sdk,
+        minify=(args.minify == "true"),
+        icon=args.icon,
+    )
