@@ -1,0 +1,200 @@
+name: Android APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App display name"
+        required: true
+        default: "MyApp"
+      package_name:
+        description: "Package name (reverse-DNS)"
+        required: true
+        default: "com.example.myapp"
+      build_type:
+        description: "Build type"
+        required: true
+        default: "debug"
+        type: choice
+        options: [debug, release]
+      zip_artifact_id:
+        description: "Run ID of uploaded zip (leave empty for scaffold mode)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout repo (contains scaffold scripts) ──────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Set up JDK 17 ──────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ── 3. Set up Android SDK ─────────────────────────────────────────
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install build tools + platform
+        run: |
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" --sdk_root=$ANDROID_HOME
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+
+      # ── 4. Download uploaded zip OR scaffold fresh project ────────────
+      - name: Prepare project
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          PKG: ${{ github.event.inputs.package_name }}
+          BUILD_TYPE: ${{ github.event.inputs.build_type }}
+          ZIP_URL: ${{ github.event.inputs.zip_artifact_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/android_project
+          if [ -n "$ZIP_URL" ]; then
+            echo "📦 Downloading uploaded project zip..."
+            curl --fail --location --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/octet-stream" \
+              "$ZIP_URL" --output /tmp/project.zip
+            unzip -q /tmp/project.zip -d /tmp/android_project
+            # If extracted into a single sub-folder, hoist it
+            INNER=$(ls /tmp/android_project | head -1)
+            if [ "$(ls /tmp/android_project | wc -l)" = "1" ] && \
+               [ -d "/tmp/android_project/$INNER" ]; then
+              mv /tmp/android_project/$INNER /tmp/android_project_real
+              mv /tmp/android_project_real /tmp/android_project
+            fi
+          else
+            echo "🏗️  Scaffolding fresh Android project..."
+            python3 builder/scaffold.py \
+              --app-name "$APP_NAME" \
+              --package "$PKG" \
+              --out /tmp/android_project
+          fi
+
+      # ── 5. Validate project structure ─────────────────────────────────
+      - name: Validate structure
+        run: |
+          echo "=== Project tree ==="
+          find /tmp/android_project -not -path "*/build/*" -not -path "*/.gradle/*" | head -80
+          if [ ! -f /tmp/android_project/settings.gradle ] && \
+             [ ! -f /tmp/android_project/settings.gradle.kts ]; then
+            echo "❌ No settings.gradle found — not a valid Android project"
+            exit 1
+          fi
+          if [ ! -f /tmp/android_project/app/build.gradle ] && \
+             [ ! -f /tmp/android_project/app/build.gradle.kts ]; then
+            echo "❌ No app/build.gradle found"
+            exit 1
+          fi
+          echo "✅ Structure valid"
+
+      # ── 6. Write local.properties ─────────────────────────────────────
+      - name: Write local.properties
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > /tmp/android_project/local.properties
+          echo "✅ local.properties written"
+
+      # ── 7. Gradle build ───────────────────────────────────────────────
+      - name: Build APK
+        working-directory: /tmp/android_project
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type }}
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Xmx3g -XX:MaxMetaspaceSize=512m"
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          TASK="assembleDebug"
+          if [ "$BUILD_TYPE" = "release" ]; then TASK="assembleRelease"; fi
+          GRADLE_CMD="./gradlew"
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then GRADLE_CMD="gradle"; fi
+          echo "⚡ Running: $GRADLE_CMD $TASK"
+          "$GRADLE_CMD" "$TASK" \
+            --no-daemon \
+            --stacktrace \
+            --build-cache \
+            2>&1 | tee /tmp/gradle_output.txt
+          EXIT=${PIPESTATUS[0]}
+          if [ $EXIT -ne 0 ]; then
+            echo "❌ Gradle build failed (exit $EXIT)"
+            echo "=== Last 60 lines ==="
+            tail -60 /tmp/gradle_output.txt
+            exit $EXIT
+          fi
+          echo "✅ Gradle build succeeded"
+
+      # ── 8. Locate APK ─────────────────────────────────────────────────
+      - name: Locate APK
+        id: locate_apk
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type }}
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          PKG: ${{ github.event.inputs.package_name }}
+        run: |
+          APK=$(find /tmp/android_project/app/build/outputs/apk -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "❌ No APK found after build"
+            exit 1
+          fi
+          SAFE_NAME=$(echo "$APP_NAME" | tr ' ' '_' | tr -cd 'a-zA-Z0-9_-')
+          DEST="/tmp/${SAFE_NAME}-${BUILD_TYPE}.apk"
+          cp "$APK" "$DEST"
+          SIZE=$(du -sh "$DEST" | cut -f1)
+          SHA=$(sha256sum "$DEST" | cut -d' ' -f1)
+          echo "apk_path=$DEST" >> $GITHUB_OUTPUT
+          echo "apk_name=${SAFE_NAME}-${BUILD_TYPE}.apk" >> $GITHUB_OUTPUT
+          echo "apk_size=$SIZE" >> $GITHUB_OUTPUT
+          echo "apk_sha256=$SHA" >> $GITHUB_OUTPUT
+          echo "✅ APK: $DEST ($SIZE) — SHA256: $SHA"
+
+      # ── 9. Verify APK ─────────────────────────────────────────────────
+      - name: Verify APK
+        env:
+          APK_PATH: ${{ steps.locate_apk.outputs.apk_path }}
+          PKG: ${{ github.event.inputs.package_name }}
+          BUILD_TYPE: ${{ github.event.inputs.build_type }}
+        run: |
+          python3 builder/verify.py \
+            --apk "$APK_PATH" \
+            --expected-package "$PKG" \
+            --build-type "$BUILD_TYPE"
+
+      # ── 10. Upload APK as artifact ────────────────────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.locate_apk.outputs.apk_name }}
+          path: ${{ steps.locate_apk.outputs.apk_path }}
+          retention-days: 7
+
+      # ── 11. Write build summary ───────────────────────────────────────
+      - name: Build summary
+        env:
+          APK_NAME: ${{ steps.locate_apk.outputs.apk_name }}
+          APK_SIZE: ${{ steps.locate_apk.outputs.apk_size }}
+          APK_SHA: ${{ steps.locate_apk.outputs.apk_sha256 }}
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          PKG: ${{ github.event.inputs.package_name }}
+          BUILD_TYPE: ${{ github.event.inputs.build_type }}
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ APK Build Successful
+
+          | Field | Value |
+          |---|---|
+          | App Name | $APP_NAME |
+          | Package | $PKG |
+          | Build Type | $BUILD_TYPE |
+          | APK Name | $APK_NAME |
+          | Size | $APK_SIZE |
+          | SHA-256 | \`$APK_SHA\` |
+
+          **Download:** Go to Actions → this run → Artifacts section
+          EOF
