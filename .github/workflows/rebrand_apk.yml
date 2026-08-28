@@ -1,0 +1,114 @@
+name: APK Rebrander (rename / re-icon)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Download URL of the source .apk (uploaded via the UI)"
+        required: true
+      app_name:
+        description: "New app display name (leave empty to keep it unchanged)"
+        required: false
+        default: ""
+      icon_base64:
+        description: "Base64-encoded PNG icon (leave empty to keep it unchanged)"
+        required: false
+        default: ""
+      output_name:
+        description: "Base filename for the output APK (no extension)"
+        required: true
+        default: "rebranded"
+
+jobs:
+  rebrand:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install build-tools + apktool
+        run: |
+          sdkmanager --sdk_root=$ANDROID_HOME "build-tools;34.0.0" "platform-tools"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          sudo apt-get update -qq
+          sudo apt-get install -y apktool
+
+      - name: Download source APK
+        env:
+          APK_URL: ${{ github.event.inputs.apk_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl --fail --location --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/octet-stream" \
+            "$APK_URL" --output /tmp/source.apk
+          echo "✅ Downloaded $(du -sh /tmp/source.apk | cut -f1)"
+
+      - name: Rebrand APK
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          ICON_B64: ${{ github.event.inputs.icon_base64 }}
+          OUT_NAME: ${{ github.event.inputs.output_name }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          NAME_ARGS=()
+          if [ -n "$APP_NAME" ]; then NAME_ARGS=(--app-name "$APP_NAME"); fi
+
+          ICON_ARGS=()
+          if [ -n "$ICON_B64" ]; then
+            echo "$ICON_B64" | base64 -d > /tmp/icon.png
+            ICON_ARGS=(--icon /tmp/icon.png)
+          fi
+
+          KEYSTORE_ARGS=()
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+            KEYSTORE_ARGS=(--keystore /tmp/release.keystore \
+              --keystore-password "$KEYSTORE_PASSWORD" \
+              --key-alias "$KEY_ALIAS" \
+              --key-password "$KEY_PASSWORD")
+          fi
+
+          SAFE_NAME=$(echo "$OUT_NAME" | tr ' ' '_' | tr -cd 'a-zA-Z0-9_-')
+          python3 builder/rebrand_apk.py \
+            --apk /tmp/source.apk \
+            --out "/tmp/${SAFE_NAME}.apk" \
+            "${NAME_ARGS[@]}" "${ICON_ARGS[@]}" "${KEYSTORE_ARGS[@]}"
+
+          rm -f /tmp/release.keystore
+          echo "apk_path=/tmp/${SAFE_NAME}.apk" >> $GITHUB_OUTPUT
+          echo "apk_name=${SAFE_NAME}.apk" >> $GITHUB_OUTPUT
+        id: rebrand
+
+      - name: Upload rebranded APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.rebrand.outputs.apk_name }}
+          path: ${{ steps.rebrand.outputs.apk_path }}
+          retention-days: 7
+
+      - name: Summary
+        env:
+          OUT_NAME: ${{ steps.rebrand.outputs.apk_name }}
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ APK Rebranded
+
+          **Output:** $OUT_NAME
+
+          **Download:** Go to Actions → this run → Artifacts section
+          EOF

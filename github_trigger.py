@@ -53,10 +53,11 @@ def _gh(method: str, path: str, body: dict | None = None) -> dict | list:
 # For large zips (>65KB input limit), we use a different strategy:
 # upload zip to a GitHub release asset and pass the download URL.
 
-def _upload_zip_to_release(zip_bytes: bytes, filename: str) -> str:
+def _upload_asset_to_release(data: bytes, filename: str, content_type: str) -> str:
     """
-    Upload zip to the latest draft release (or create one) and return the
-    download URL. This bypasses the workflow_dispatch input size limit.
+    Upload a file to the 'uploads' release (creating it if needed) and return
+    the download URL. This bypasses the workflow_dispatch input size limit —
+    used for project zips, source APKs, etc.
     """
     # Get or create a 'uploads' release
     try:
@@ -89,20 +90,41 @@ def _upload_zip_to_release(zip_bytes: bytes, filename: str) -> str:
     except Exception:
         pass
 
-    # Upload the zip
     upload_req = urllib.request.Request(
         f"{upload_url}?name={filename}",
-        data=zip_bytes,
+        data=data,
         headers={
             **HEADERS,
             "Authorization": f"Bearer {GH_TOKEN}",
-            "Content-Type": "application/zip",
+            "Content-Type": content_type,
         },
         method="POST",
     )
     with urllib.request.urlopen(upload_req, timeout=60) as resp:
         asset = json.loads(resp.read())
     return asset["browser_download_url"]
+
+
+def _upload_zip_to_release(zip_bytes: bytes, filename: str) -> str:
+    return _upload_asset_to_release(zip_bytes, filename, "application/zip")
+
+
+def _dispatch_and_get_run_id(workflow_file: str, inputs: dict) -> str:
+    """Trigger a workflow_dispatch run and return its run ID."""
+    _gh("POST", f"actions/workflows/{workflow_file}/dispatches", {
+        "ref": GH_BRANCH,
+        "inputs": inputs,
+    })
+
+    # Poll for the new run (GH takes ~2s to register it)
+    for _ in range(15):
+        time.sleep(3)
+        runs = _gh("GET", f"actions/workflows/{workflow_file}/runs?per_page=5")
+        run_list = runs.get("workflow_runs", [])
+        if run_list:
+            return str(run_list[0]["id"])
+
+    raise RuntimeError("Workflow run not found after trigger — check GitHub Actions tab.")
 
 
 # ── Main public API ───────────────────────────────────────────────────────────
@@ -148,23 +170,38 @@ def trigger_build(
         download_url = _upload_zip_to_release(zip_bytes, zip_filename)
         inputs["zip_artifact_id"] = download_url  # workflow reads this
 
-    # Trigger workflow_dispatch
-    _gh("POST", f"actions/workflows/{WORKFLOW}/dispatches", {
-        "ref": GH_BRANCH,
-        "inputs": inputs,
-    })
+    return _dispatch_and_get_run_id(WORKFLOW, inputs)
 
-    # Poll for the new run (GH takes ~2s to register it)
-    for _ in range(15):
-        time.sleep(3)
-        runs = _gh("GET", f"actions/workflows/{WORKFLOW}/runs?per_page=5")
-        run_list = runs.get("workflow_runs", [])
-        if run_list:
-            latest = run_list[0]
-            # Match by approximate trigger time
-            return str(latest["id"])
 
-    raise RuntimeError("Workflow run not found after trigger — check GitHub Actions tab.")
+REBRAND_WORKFLOW = os.environ.get("GH_REBRAND_WORKFLOW", "rebrand_apk.yml")
+
+
+def trigger_rebrand(
+    apk_bytes: bytes,
+    apk_filename: str = "source.apk",
+    app_name: str | None = None,
+    icon_bytes: bytes | None = None,
+    output_name: str = "rebranded",
+) -> str:
+    """
+    Upload an existing APK and trigger the rebrand workflow (rename the app
+    and/or swap its icon without rebuilding from source).
+    Returns the workflow run ID to poll later.
+    """
+    import base64
+
+    if not app_name and not icon_bytes:
+        raise ValueError("Provide app_name and/or icon_bytes — nothing to rebrand otherwise.")
+
+    apk_url = _upload_asset_to_release(apk_bytes, apk_filename, "application/vnd.android.package-archive")
+
+    inputs = {
+        "apk_url": apk_url,
+        "app_name": app_name or "",
+        "icon_base64": base64.b64encode(icon_bytes).decode() if icon_bytes else "",
+        "output_name": output_name,
+    }
+    return _dispatch_and_get_run_id(REBRAND_WORKFLOW, inputs)
 
 
 def poll_run(run_id: str) -> Generator[dict, None, dict]:
